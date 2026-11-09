@@ -1,31 +1,39 @@
-// Deep-dip reversion on cbBTC/USDC for make.fun's 24-hour BTC race (agent-fun/bars-replay/v1).
+// Anchor dip on cbBTC/USDC for make.fun's 24-hour BTC race (agent-fun/bars-replay/v1).
 //
-// The idea: stay in cash, and only buy a deep dip with a small slice of equity.
+// A ranking game more than a trading edge: a full round trip costs about 26 bps, and no rule tested
+// on six months of 1-minute BTC beats that on average. What does move the rank is the entry price.
+// Most days dip a little below where they start before they go anywhere, so this bot waits for that
+// dip and then holds, which beats every bot that bought on the first bar by about the dip on any day
+// that dips, and sits near zero on a day that never does.
 //
-//   - Every bar's close updates an EMA of closes (EMA_BARS, seeded at the first close).
-//   - Flat, once WARMUP_BARS closes have been seen: when the close sits more than DIP_BPS under the
-//     EMA, buy STAKE_BPS of equity (the order fills at the next bar's open).
-//   - Holding: sell the whole position once the close is TAKE_PROFIT_BPS over the close it was bought
-//     on, or STOP_BPS under it (a wide stop, only for a crash).
-//   - A 1 USDC probe buy on the first bar, sold on the next one, so the run always holds the one filled
-//     trade the guardrail asks for, even on a day that never dips.
+//   - First bar: remember its close as the anchor, and buy PROBE_QUOTE_UNITS (1.2 USDC), the one
+//     filled trade the guardrail asks for (held to the end).
+//   - Waiting: when a close sits DIP_BPS or more under the anchor, enter.
+//   - Entering, over ENTRY_SLICES batches from the trigger: buy 1/3 of the cash, then 1/2 of what is
+//     left, then all of it. Each slice trades against its own bar's pool, so three slices pay about a
+//     third of one full-size order's price impact.
+//   - Holding: no stop, no take-profit. On the third-last and second-last bars of the window it sells
+//     1/3 and then 1/2 of the position (same impact saving on the way out); the replay sells the rest
+//     at the last close.
 //
-// Each batch the bot compares what it wants to hold with what the account holds, so an order the
-// market refuses (no bar at the next open, a price past max_slippage) is simply sent again later.
-// Deterministic: float64 arithmetic on + - * / only, bigint money, no clock, no randomness, no files.
+// The window's bars are found by time (hello.first_close_ms plus WINDOW_BARS - 1 minutes is the last
+// close), never by counting batches, so a minute with no bar shifts nothing. A slice the market
+// refuses is bought on the next batch instead. Deterministic: bigint money and integer comparisons
+// only, no clock, no randomness, no files.
 
 import { BPS, runBars, type Batch, type BarsState, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
+const MINUTE_MS = 60_000;
+/** The race and the dev window are both 1,440 one-minute bars. */
+const WINDOW_BARS = 1440;
 
-const EMA_BARS = 240;
-const WARMUP_BARS = 60;
-const DIP_BPS = 80;
-const STAKE_BPS = 3_000n;
-const TAKE_PROFIT_BPS = 120n;
-const STOP_BPS = 250n;
+const DIP_BPS = 30n;
+const ENTRY_SLICES = 3;
+const EXIT_SLICES = 3;
 
-const PROBE_QUOTE_UNITS = 1_000_000n;
+const PROBE_QUOTE_UNITS = 1_200_000n;
+const MIN_ORDER_QUOTE_UNITS = 1_000_000n;
 const BUY_MAX_SLIPPAGE_BPS = 300;
 const SELL_MAX_SLIPPAGE_BPS = 1_000;
 
@@ -34,51 +42,48 @@ type Order = BuyInput | SellInput;
 const buy = (amount: bigint): BuyInput => ({ side: 'buy', symbol: SYMBOL, notional_quote_units: amount, max_slippage_bps: BUY_MAX_SLIPPAGE_BPS });
 const sell = (qty: bigint): SellInput => ({ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: SELL_MAX_SLIPPAGE_BPS });
 
-let ema: number | null = null;
-let seen = 0;
-/** The close the current position was bought on (null when flat). */
-let entryClose: bigint | null = null;
-let probe: 'todo' | 'bought' | 'done' = 'todo';
+let anchor: bigint | null = null;
+let phase: 'wait' | 'enter' | 'hold' = 'wait';
+/** Entry slices sent so far. */
+let slices = 0;
 
 function decide(state: BarsState, batch: Batch): Order[] {
   const bar = batch.bars.find((b) => b.symbol === SYMBOL);
-  const qty = state.positions.get(SYMBOL)?.qty ?? 0n;
   if (bar === undefined) return [];
   const close = BigInt(bar.c);
-  const price = Number(bar.c);
-  ema = ema === null ? price : ema + (2 / (EMA_BARS + 1)) * (price - ema);
-  seen++;
+  const qty = state.positions.get(SYMBOL)?.qty ?? 0n;
+  // bars of the window left after this one (0 on the last bar, whose orders the replay refuses)
+  const left = (state.hello.first_close_ms + (WINDOW_BARS - 1) * MINUTE_MS - batch.t) / MINUTE_MS;
 
-  if (probe === 'todo') {
-    probe = 'bought';
+  if (anchor === null) {
+    anchor = close;
     return [buy(PROBE_QUOTE_UNITS)];
   }
-  if (probe === 'bought') {
-    if (qty > 0n) {
-      probe = 'done';
-      return [sell(qty)];
+
+  if (phase === 'wait') {
+    if (left < EXIT_SLICES) return [];
+    if (close * BPS > anchor * (BPS - DIP_BPS)) return [];
+    phase = 'enter';
+  }
+
+  if (phase === 'enter') {
+    if (left < EXIT_SLICES) {
+      phase = 'hold';
+    } else {
+      const parts = BigInt(ENTRY_SLICES - slices > 1 ? ENTRY_SLICES - slices : 1);
+      slices++;
+      if (slices >= ENTRY_SLICES) phase = 'hold';
+      const amount = state.cash / parts;
+      return amount >= MIN_ORDER_QUOTE_UNITS ? [buy(amount)] : [];
     }
-    // the probe buy was refused: try it again
-    return [buy(PROBE_QUOTE_UNITS)];
   }
 
-  if (qty > 0n) {
-    // holding without a recorded entry (should not happen): exit at once
-    if (entryClose === null) return [sell(qty)];
-    const tp = close * BPS >= entryClose * (BPS + TAKE_PROFIT_BPS);
-    const sl = close * BPS <= entryClose * (BPS - STOP_BPS);
-    return tp || sl ? [sell(qty)] : [];
-  }
-
-  // flat
-  entryClose = null;
-  if (seen < WARMUP_BARS) return [];
-  if (price * 10_000 < ema * (10_000 - DIP_BPS)) {
-    let amount = (state.equity * STAKE_BPS) / BPS;
-    if (amount > state.cash) amount = state.cash;
-    if (amount < PROBE_QUOTE_UNITS) return [];
-    entryClose = close;
-    return [buy(amount)];
+  // holding: a slice the market refused is bought now, then the exit split at the end
+  if (left >= EXIT_SLICES && state.cash >= MIN_ORDER_QUOTE_UNITS) return [buy(state.cash)];
+  if (left >= 1 && left < EXIT_SLICES && qty > 0n) {
+    // left = 2: sell 1/3; left = 1: sell 1/2 of what is left
+    const part = qty / BigInt(left + 1);
+    return state.value(SYMBOL, part) >= MIN_ORDER_QUOTE_UNITS ? [sell(part)] : [];
   }
   return [];
 }

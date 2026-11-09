@@ -1,4 +1,4 @@
-# cbBTC deep-dip bot
+# cbBTC anchor-dip bot
 
 A long-only bot for make.fun's 24-hour BTC race: it trades Coinbase Wrapped BTC (cbBTC) against USDC
 on 1-minute bars of the Orca Whirlpool pool, with 1,000 USDC of paper money, over the
@@ -6,17 +6,17 @@ on 1-minute bars of the Orca Whirlpool pool, with 1,000 USDC of paper money, ove
 
 ## Strategy
 
-It stays in cash and only buys a deep dip, with a small slice of equity:
+A full round trip costs about 26 bps in fees, slippage and pool impact, and no rule tested on six
+months of 1-minute BTC beats that on average, so the bot plays for its entry price instead:
 
-- an EMA of closes over 240 bars, seeded at the first close;
-- after 60 bars, when the close sits more than 0.8% under the EMA, it buys 30% of equity
-  (filled at the next bar's open);
-- it sells the whole position at +1.2% over the close it bought on, or at -2.5% (a crash stop);
-- a 1 USDC probe buy on the first bar, sold on the next one, keeps the guardrail's one trade.
+- it remembers the first bar's close as the anchor and buys a 1.2 USDC probe (the guardrail's trade);
+- when a close sits 0.3% or more under the anchor, it buys in three slices over three bars
+  (1/3, 1/2, then all of the cash), each against its own bar's pool, and holds;
+- on the third-last and second-last bars it sells 1/3 and 1/2 of the position; the replay sells the
+  rest at the last close.
 
-A full round trip costs about 26 bps in fees, slippage and pool impact, so the bot trades rarely and
-only on moves well past that. The small stake keeps the drawdown low on a falling day, which is when a
-cash-heavy dip buyer has its edge over the many bots that hold BTC.
+On a day that dips first, it beats every bot that bought on the first bar by about the dip; on a day
+that never dips it stays near zero.
 
 ## Run
 
